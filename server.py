@@ -4,6 +4,7 @@ import uuid
 
 # In-memory presence/call state. Run one server process for this version.
 users = {}          # user_id -> WebSocketResponse
+user_names = {}     # user_id -> display name
 calls = {}          # caller_id -> callee_id
 accepted_calls = set()  # caller IDs whose calls were accepted
 chat_history = {}  # sorted pair of user IDs -> private message list
@@ -214,10 +215,36 @@ button:disabled { opacity: .4; cursor: not-allowed; }
     .user-actions button { padding:9px 10px; }
 }
 
+
+#messageToast {
+    display:none; position:fixed; z-index:50; left:50%; bottom:24px;
+    transform:translateX(-50%); max-width:min(92vw,420px);
+    padding:12px 16px; border-radius:12px;
+    color:#f8fafc; background:#263958; border:1px solid rgba(148,163,184,.25);
+    box-shadow:0 12px 36px rgba(0,0,0,.35); font-size:13px;
+}
+#messageToast.show { display:block; }
+
 </style>
 </head>
 <body>
-<main class="container">
+
+<section id="loginGate" class="panel" style="max-width:430px;margin:9vh auto;padding:28px;">
+  <div class="brand" style="margin-bottom:24px;">
+    <div class="brand-mark">V</div>
+    <div><div class="brand-name">VConnect</div><div class="brand-sub">Your local communication space</div></div>
+  </div>
+  <h1 style="font-size:27px;">Welcome to VConnect</h1>
+  <p class="hero-copy">Choose a display name to appear in the people directory.</p>
+  <form id="loginForm" style="display:flex;gap:9px;margin-top:20px;">
+    <input id="displayName" maxlength="32" required autocomplete="nickname"
+      placeholder="Your name" style="min-width:0;flex:1;padding:13px;border-radius:11px;border:1px solid var(--line);background:#0c1729;color:white;font:inherit;">
+    <button class="call" type="submit">Continue</button>
+  </form>
+  <p id="loginStatus" style="color:var(--muted);font-size:12px;margin-top:12px;">Enter a name to join.</p>
+</section>
+
+<main class="container" id="appMain" style="display:none;">
     <header class="topbar">
         <div class="brand">
             <div class="brand-mark">V</div>
@@ -265,6 +292,7 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 </main>
 
 
+<div id="messageToast" role="status" aria-live="polite"></div>
 <section id="chatPanel" aria-label="Private one-to-one chat">
     <header class="chat-head">
         <div class="chat-peer">
@@ -303,7 +331,8 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 "use strict";
 
 const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-const ws = new WebSocket(wsProtocol + "//" + location.host + "/ws");
+let ws = null;
+let requestedDisplayName = "";
 
 let myId = null;
 let incomingCaller = null;
@@ -330,7 +359,7 @@ function setCallStatus(message) {
 }
 
 function send(data) {
-    if (ws.readyState !== WebSocket.OPEN) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
         $("status").textContent = "Server connection lost. Refresh this page to reconnect.";
         return false;
     }
@@ -495,6 +524,7 @@ function resetCall() {
 
 let lastUsers = [];
 let activeChatUser = null;
+let unreadCounts = {};
 
 function renderUsers(users) {
     lastUsers = users || [];
@@ -513,7 +543,7 @@ function renderUsers(users) {
             const item = document.createElement("div");
             item.className = "user" + (isSelf ? " self" : "");
             const label = document.createElement("span");
-            label.textContent = isSelf ? "You · " + user.id : "User " + user.id;
+            label.textContent = isSelf ? "You · " + (user.name || user.id) : (user.name || "User " + user.id);
 
             const actions = document.createElement("div");
             actions.className = "user-actions";
@@ -521,7 +551,7 @@ function renderUsers(users) {
             if (!isSelf) {
                 const messageButton = document.createElement("button");
                 messageButton.className = "message-btn";
-                messageButton.textContent = "Message";
+                messageButton.textContent = unreadCounts[user.id] ? "Message (" + unreadCounts[user.id] + ")" : "Message";
                 messageButton.onclick = () => openChat(user.id);
                 actions.appendChild(messageButton);
 
@@ -574,11 +604,21 @@ function appendChatMessage(message) {
     area.scrollTop = area.scrollHeight;
 }
 
+function showMessageToast(text) {
+    const toast = $("messageToast");
+    toast.textContent = text;
+    toast.classList.add("show");
+    clearTimeout(showMessageToast.timer);
+    showMessageToast.timer = setTimeout(() => toast.classList.remove("show"), 2600);
+}
+
 function openChat(userId) {
     const user = lastUsers.find(item => item.id === userId);
     if (!user || userId === myId) return;
     activeChatUser = userId;
-    $("chatTitle").textContent = "User " + userId;
+    unreadCounts[userId] = 0;
+    renderUsers(lastUsers);
+    $("chatTitle").textContent = (user.name || "User " + userId);
     $("chatPanel").classList.add("open");
     $("chatInput").focus();
     renderChatMessages([]);
@@ -653,11 +693,36 @@ function toggleCamera() {
     $("cameraButton").textContent = enabled ? "Turn camera off" : "Turn camera on";
 }
 
-ws.onopen = () => {
-    $("status").textContent = "Connected to calling server.";
-};
+function connectWithName(name) {
+    requestedDisplayName = name;
+    $("loginStatus").textContent = "Connecting…";
+    ws = new WebSocket(wsProtocol + "//" + location.host + "/ws");
+    ws.onmessage = handleSocketMessage;
+    ws.onopen = () => {
+        ws.send(JSON.stringify({ type: "set_name", name: requestedDisplayName }));
+        $("loginStatus").textContent = "Connected.";
+        $("loginGate").style.display = "none";
+        $("appMain").style.display = "block";
+        $("status").textContent = "Connected to VConnect.";
+    };
+    ws.onclose = () => {
+        $("status").textContent = "Disconnected from server. Refresh to reconnect.";
+        resetCall();
+    };
+    ws.onerror = () => {
+        $("loginStatus").textContent = "Could not connect. Check that the server is running.";
+        $("status").textContent = "WebSocket connection error.";
+    };
+}
 
-ws.onmessage = async event => {
+$("loginForm").addEventListener("submit", event => {
+    event.preventDefault();
+    const name = $("displayName").value.trim().replace(/\s+/g, " ");
+    if (!name) return;
+    connectWithName(name.slice(0, 32));
+});
+
+async function handleSocketMessage(event) {
     let data;
     try {
         data = JSON.parse(event.data);
@@ -675,8 +740,13 @@ ws.onmessage = async event => {
         } else if (data.type === "chat_history") {
             if (activeChatUser === data.with) renderChatMessages(data.messages);
         } else if (data.type === "chat_message") {
-            if (activeChatUser === data.from || activeChatUser === data.to) {
+            const otherUser = data.from === myId ? data.to : data.from;
+            if (activeChatUser === otherUser && $("chatPanel").classList.contains("open")) {
                 appendChatMessage(data.message);
+            } else if (data.from !== myId) {
+                unreadCounts[otherUser] = (unreadCounts[otherUser] || 0) + 1;
+                renderUsers(lastUsers);
+                showMessageToast("New message from user " + otherUser);
             }
         } else if (data.type === "incoming_call") {
             if (currentCall || incomingCaller) {
@@ -716,15 +786,9 @@ ws.onmessage = async event => {
         console.error(error);
         setCallStatus("Call error: " + error.message);
     }
-};
+}
 
-ws.onclose = () => {
-    $("status").textContent = "Disconnected from server. Refresh to reconnect.";
-    resetCall();
-};
-ws.onerror = () => {
-    $("status").textContent = "WebSocket connection error.";
-};
+
 </script>
 </body>
 </html>
@@ -762,7 +826,7 @@ def find_call(user_id):
 
 
 async def broadcast_users():
-    message = {"type": "users", "users": [{"id": uid} for uid in list(users)]}
+    message = {"type": "users", "users": [{"id": uid, "name": user_names.get(uid, "Guest")} for uid in list(users)]}
     sockets = [ws.send_json(message) for ws in list(users.values()) if not ws.closed]
     if sockets:
         await asyncio.gather(*sockets, return_exceptions=True)
@@ -779,9 +843,10 @@ async def websocket_handler(request):
 
     user_id = str(uuid.uuid4())[:8]
     users[user_id] = ws
+    user_names[user_id] = "Guest"
     print("User joined:", user_id)
 
-    await ws.send_json({"type": "welcome", "id": user_id})
+    await ws.send_json({"type": "welcome", "id": user_id, "name": "Guest"})
     await broadcast_users()
 
     try:
@@ -798,7 +863,18 @@ async def websocket_handler(request):
             action = data.get("type")
             target = data.get("target")
 
-            if action == "chat_open":
+            if action == "set_name":
+                name = data.get("name")
+                if not isinstance(name, str):
+                    continue
+                name = " ".join(name.split())[:32]
+                if not name:
+                    continue
+                user_names[user_id] = name
+                await ws.send_json({"type": "profile", "id": user_id, "name": name})
+                await broadcast_users()
+
+            elif action == "chat_open":
                 if not isinstance(target, str) or target not in users or target == user_id:
                     await ws.send_json({"type": "error", "message": "That user is not online."})
                     continue
@@ -831,14 +907,16 @@ async def websocket_handler(request):
                 chat_history[pair_key] = chat_history[pair_key][-200:]
 
                 # Deliver only to the two participants in this private conversation.
-                await ws.send_json({
+                outgoing = {
                     "type": "chat_message", "from": user_id, "to": target,
                     "message": message
-                })
-                await send_to(target, {
-                    "type": "chat_message", "from": user_id, "to": target,
-                    "message": message
-                })
+                }
+                # Deliver immediately to both ends without serial WebSocket writes.
+                await asyncio.gather(
+                    ws.send_json(outgoing),
+                    send_to(target, outgoing),
+                    return_exceptions=True
+                )
 
             elif action == "call":
                 if not isinstance(target, str) or target not in users or target == user_id:
@@ -849,7 +927,7 @@ async def websocket_handler(request):
                     continue
 
                 calls[user_id] = target
-                delivered = await send_to(target, {"type": "incoming_call", "from": user_id})
+                delivered = await send_to(target, {"type": "incoming_call", "from": user_id, "name": user_names.get(user_id, "Someone")})
                 if not delivered:
                     clear_call(user_id)
                     await ws.send_json({"type": "error", "message": "The user disconnected. Try again."})
@@ -914,6 +992,7 @@ async def websocket_handler(request):
         # Remove only this socket's user entry.
         if users.get(user_id) is ws:
             users.pop(user_id, None)
+        user_names.pop(user_id, None)
 
         pair = find_call(user_id)
         if pair:
